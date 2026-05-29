@@ -138,6 +138,9 @@ func TestSetApplicationHealth_OnlyHooks(t *testing.T) {
 	assert.Empty(t, healthCauses)
 }
 
+// Pod kind has a built-in health check, so a Live==nil Pod must aggregate as
+// Missing (so parent app-of-apps wave gates hold). Originally asserted Healthy
+// when introduced with #25962; flipped to Missing as part of the #27917 fix.
 func TestSetApplicationHealth_MissingResource(t *testing.T) {
 	pod := resourceFromFile("./testdata/pod-running-restart-always.yaml")
 	pod2 := pod.DeepCopy()
@@ -151,11 +154,14 @@ func TestSetApplicationHealth_MissingResource(t *testing.T) {
 
 	healthStatus, healthCauses, err := setApplicationHealth(resources, resourceStatuses, lua.ResourceHealthOverrides{}, app, true)
 	require.NoError(t, err)
-	assert.Equal(t, health.HealthStatusHealthy, healthStatus)
-	// The missing target-only resource does not degrade the app, so there are no causes.
-	assert.Empty(t, healthCauses)
+	assert.Equal(t, health.HealthStatusMissing, healthStatus)
+	// The missing Pod (built-in health check) is now an aggregation cause.
+	assert.Contains(t, healthCauses, "Pod:")
 }
 
+// Same as above but the Live!=nil sibling carries the ignore-healthcheck
+// annotation. The Live==nil Pod still aggregates as Missing because Pod has a
+// built-in health check; the annotation only suppresses the Live!=nil resource.
 func TestSetApplicationHealth_MissingResource_WithIgnoreHealthcheck(t *testing.T) {
 	pod := resourceFromFile("./testdata/pod-running-restart-always.yaml")
 	pod2 := pod.DeepCopy()
@@ -170,11 +176,14 @@ func TestSetApplicationHealth_MissingResource_WithIgnoreHealthcheck(t *testing.T
 
 	healthStatus, healthCauses, err := setApplicationHealth(resources, resourceStatuses, lua.ResourceHealthOverrides{}, app, true)
 	require.NoError(t, err)
-	assert.Equal(t, health.HealthStatusHealthy, healthStatus)
-	// The ignored resource is not aggregated, so the Healthy app has no causes.
-	assert.Empty(t, healthCauses)
+	assert.Equal(t, health.HealthStatusMissing, healthStatus)
+	// The missing Pod (built-in health check) is now an aggregation cause.
+	assert.Contains(t, healthCauses, "Pod:")
 }
 
+// A Live!=nil child Application with no registered override falls through
+// (GetResourceHealth returns nil and the loop continues), so the Live==nil
+// Pod sibling drives the aggregate to Missing (Pod has built-in health).
 func TestSetApplicationHealth_MissingResource_WithChildApp(t *testing.T) {
 	childApp := newAppLiveObj(health.HealthStatusUnknown)
 	pod := resourceFromFile("./testdata/pod-running-restart-always.yaml")
@@ -186,9 +195,35 @@ func TestSetApplicationHealth_MissingResource_WithChildApp(t *testing.T) {
 
 	healthStatus, healthCauses, err := setApplicationHealth(resources, resourceStatuses, lua.ResourceHealthOverrides{}, app, true)
 	require.NoError(t, err)
-	assert.Equal(t, health.HealthStatusHealthy, healthStatus)
-	// An Unknown child app does not affect the parent, so the Healthy app has no causes.
-	assert.Empty(t, healthCauses)
+	assert.Equal(t, health.HealthStatusMissing, healthStatus)
+	// The missing Pod (built-in health check) is now an aggregation cause.
+	assert.Contains(t, healthCauses, "Pod:")
+}
+
+// Regression test for #27917. A child Application with a mix of applied
+// resources (Live!=nil) and resources whose apply failed (Live==nil) must
+// aggregate as Missing — not Healthy — when the failed resource's kind has
+// a registered health check (override or built-in). Otherwise parent
+// app-of-apps wave gates release prematurely.
+func TestSetApplicationHealth_MissingResource_WithRegisteredHealthCheck(t *testing.T) {
+	runningPod := resourceFromFile("./testdata/pod-running-restart-always.yaml")
+
+	overrides := lua.ResourceHealthOverrides{
+		lua.GetConfigMapKey(schema.GroupVersionKind{Group: "example.com", Version: "v1", Kind: "Widget"}): appv1.ResourceOverride{
+			HealthLua: `hs = {} hs.status = "Healthy" return hs`,
+		},
+	}
+
+	resources := []managedResource{
+		{Group: "", Version: "v1", Kind: "Pod", Live: &runningPod},
+		{Group: "example.com", Version: "v1", Kind: "Widget"},
+	}
+	resourceStatuses := initStatuses(resources)
+
+	healthStatus, healthCauses, err := setApplicationHealth(resources, resourceStatuses, overrides, app, true)
+	require.NoError(t, err)
+	assert.Equal(t, health.HealthStatusMissing, healthStatus)
+	assert.Contains(t, healthCauses, "example.com/Widget:")
 }
 
 func TestSetApplicationHealth_AllMissingResources(t *testing.T) {
@@ -205,8 +240,9 @@ func TestSetApplicationHealth_AllMissingResources(t *testing.T) {
 	healthStatus, healthCauses, err := setApplicationHealth(resources, resourceStatuses, lua.ResourceHealthOverrides{}, app, true)
 	require.NoError(t, err)
 	assert.Equal(t, health.HealthStatusMissing, healthStatus)
-	// The Missing app health from the all-missing fallback does not attribute individual causes.
-	assert.Empty(t, healthCauses)
+	// Pod has a built-in health check, so with the #27917 fix each missing Pod
+	// aggregates as Missing in the loop and is attributed as a cause.
+	assert.Equal(t, "Caused by Pod:default/pod, Pod:default/pod2", healthCauses)
 }
 
 func TestSetApplicationHealth_AllMissingResources_WithHooks(t *testing.T) {
@@ -225,8 +261,9 @@ func TestSetApplicationHealth_AllMissingResources_WithHooks(t *testing.T) {
 	healthStatus, healthCauses, err := setApplicationHealth(resources, resourceStatuses, lua.ResourceHealthOverrides{}, app, true)
 	require.NoError(t, err)
 	assert.Equal(t, health.HealthStatusMissing, healthStatus)
-	// The all-missing fallback does not attribute individual causes.
-	assert.Empty(t, healthCauses)
+	// The missing (non-hook) Pod has a built-in health check, so with the #27917
+	// fix it aggregates as Missing in the loop and is attributed as a cause.
+	assert.Contains(t, healthCauses, "Pod:")
 }
 
 func TestSetApplicationHealth_MultipleCauses(t *testing.T) {
