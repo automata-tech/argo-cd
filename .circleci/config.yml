@@ -1,0 +1,121 @@
+version: 2.1
+
+# Automata fork of argoproj/argo-cd. Upstream builds with GitHub Actions; this
+# config only builds the Automata patched image and pushes it to ECR
+# (atmta028 software-artifacts), the same way claudtainer does: each arch is
+# built natively (no QEMU), then both are combined into one manifest list.
+#
+# Runs only on tags like v3.6.1-waves. The ECR repository's lifecycle policy
+# (terragrunt-infra aws/atmta028/eu-west-1/ecr-repositories) keeps only the
+# v3.6.1-waves* tags, so anything else pushed there expires after 1 day.
+
+orbs:
+  aws-cli: circleci/aws-cli@5.1.1
+  aws-ecr: circleci/aws-ecr@9
+
+parameters:
+  ecr-account:
+    type: string
+    default: "401732561735" # atmta028 software-artifacts
+  ecr-repo:
+    type: string
+    default: automata-tech/argocd
+
+commands:
+  compute_version:
+    steps:
+      - run:
+          name: Compute VERSION + REGISTRY
+          command: |
+            echo "export VERSION=${CIRCLE_TAG}" >> "$BASH_ENV"
+            echo "export REGISTRY=<< pipeline.parameters.ecr-account >>.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com" >> "$BASH_ENV"
+
+  build_push_arch:
+    parameters:
+      arch: { type: string }
+    steps:
+      - checkout
+      - compute_version
+      - aws-cli/setup:
+          role_arn: $AWS_OIDC_ROLE_ARN_ATMTA028
+          role_session_name: $CIRCLE_PROJECT_REPONAME
+          region: $AWS_DEFAULT_REGION
+      # GIT_* build args stamp `argocd version` (the Dockerfile has no .git, so
+      # without them the Makefile reports the tree as dirty).
+      - aws-ecr/build_and_push_image:
+          account_id: << pipeline.parameters.ecr-account >>
+          auth: []
+          region: $AWS_DEFAULT_REGION
+          repo: << pipeline.parameters.ecr-repo >>
+          tag: "${VERSION}-<< parameters.arch >>"
+          dockerfile: Dockerfile
+          path: .
+          build_path: .
+          platform: linux/<< parameters.arch >>
+          extra_build_args: >-
+            --provenance=false --sbom=false
+            --build-arg GIT_COMMIT=${CIRCLE_SHA1}
+            --build-arg GIT_TAG=${CIRCLE_TAG}
+            --build-arg GIT_TREE_STATE=clean
+          skip_when_tags_exist: true
+
+jobs:
+  build_amd64_container:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: large
+    steps:
+      - build_push_arch:
+          arch: amd64
+
+  build_arm64_container:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: arm.large
+    steps:
+      - build_push_arch:
+          arch: arm64
+
+  combine_docker_containers_and_push:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - setup_remote_docker
+      - compute_version
+      - aws-cli/setup:
+          role_arn: $AWS_OIDC_ROLE_ARN_ATMTA028
+          role_session_name: $CIRCLE_PROJECT_REPONAME
+          region: $AWS_DEFAULT_REGION
+      - run:
+          name: Combine arch images into one manifest & push
+          command: |
+            aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+              | docker login --username AWS --password-stdin "$REGISTRY"
+            repo="${REGISTRY}/<< pipeline.parameters.ecr-repo >>"
+            output_tag="${repo}:${VERSION}"
+            if docker manifest inspect "$output_tag" >/dev/null 2>&1; then
+              echo "Manifest $output_tag already exists; skipping."
+            else
+              docker manifest create "$output_tag" \
+                "${repo}:${VERSION}-amd64" \
+                "${repo}:${VERSION}-arm64"
+              docker manifest push "$output_tag"
+            fi
+
+workflows:
+  build-release:
+    jobs:
+      - build_amd64_container:
+          context: [aws-oidc-roles]
+          filters: &tag-filters
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^v[0-9]+\.[0-9]+\.[0-9]+-waves$/
+      - build_arm64_container:
+          context: [aws-oidc-roles]
+          filters: *tag-filters
+      - combine_docker_containers_and_push:
+          context: [aws-oidc-roles]
+          requires: [build_amd64_container, build_arm64_container]
+          filters: *tag-filters
